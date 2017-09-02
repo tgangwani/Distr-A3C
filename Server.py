@@ -39,13 +39,13 @@ from ThreadTrainer import ThreadTrainer
 
 
 class Server:
-    def __init__(self):
-        self.stats = ProcessStats()
+    def __init__(self, cluster_spec, job_name, task_index, num_workers):
+        self.stats = ProcessStats(task_index)
 
         self.training_q = Queue(maxsize=Config.MAX_QUEUE_SIZE)
         self.prediction_q = Queue(maxsize=Config.MAX_QUEUE_SIZE)
 
-        self.model = NetworkVP(Config.DEVICE, Config.NETWORK_NAME, Environment().get_num_actions())
+        self.model = NetworkVP(cluster_spec, job_name, task_index, num_workers, Config.DEVICE, Config.NETWORK_NAME, Environment().get_num_actions())
         if Config.LOAD_CHECKPOINT:
             self.stats.episode_count.value = self.model.load()
 
@@ -86,8 +86,8 @@ class Server:
         self.trainers.pop()
 
     def train_model(self, x_, r_, a_, trainer_id):
-        self.model.train(x_, r_, a_, trainer_id)
         self.training_step += 1
+        self.model.train(x_, r_, a_, trainer_id, self.training_step)
         self.frame_counter += x_.shape[0]
 
         self.stats.training_count.value += 1
@@ -121,6 +121,8 @@ class Server:
                 self.save_model()
                 self.stats.should_save_model.value = 0
 
+            if Config.PROFILE_COMM: 
+                self.stats.comm_time.value = self.model.get_comm_time(self.training_step)
             time.sleep(0.01)
 
         self.dynamic_adjustment.exit_flag = True

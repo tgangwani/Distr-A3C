@@ -28,12 +28,23 @@ import os
 import re
 import numpy as np
 import tensorflow as tf
-
+import time
 from Config import Config
 
+def timing(function):
+  if Config.PROFILE_COMM == False:
+    return function
+
+  def wrapper(self, *args, **kwargs):
+    time1 = time.time()
+    ret = function(self, *args, **kwargs)
+    time2 = time.time()
+    self.total_network_delay += (time2-time1)
+    return ret
+  return wrapper
 
 class NetworkVP:
-    def __init__(self, device, model_name, num_actions):
+    def __init__(self, cluster_spec, job_name, task_index, num_workers, device, model_name, num_actions):
         self.device = device
         self.model_name = model_name
         self.num_actions = num_actions
@@ -46,26 +57,97 @@ class NetworkVP:
         self.beta = Config.BETA_START
         self.log_epsilon = Config.LOG_EPSILON
 
-        self.graph = tf.Graph()
-        with self.graph.as_default() as g:
+        self.total_network_delay = int(0) # in seconds
+        
+        self.local_graph = tf.Graph()
+        with self.local_graph.as_default() as g:
             with tf.device(self.device):
-                self._create_graph()
+                self._create_local_graph()
 
                 self.sess = tf.Session(
-                    graph=self.graph,
+                    graph=self.local_graph,
                     config=tf.ConfigProto(
                         allow_soft_placement=True,
                         log_device_placement=False,
                         gpu_options=tf.GPUOptions(allow_growth=True)))
                 self.sess.run(tf.global_variables_initializer())
 
-                if Config.TENSORBOARD: self._create_tensor_board()
-                if Config.LOAD_CHECKPOINT or Config.SAVE_MODELS:
-                    vars = tf.global_variables()
-                    self.saver = tf.train.Saver({var.name: var for var in vars}, max_to_keep=0)
+            if Config.LOAD_CHECKPOINT or Config.SAVE_MODELS:
+              vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='local')
+              self.saver = tf.train.Saver({var.name: var for var in vars}, max_to_keep=10)
                 
+        server_config = tf.ConfigProto(log_device_placement = False,
+            allow_soft_placement = True, device_filters=["/job:ps",
+              "/job:%s/task:%d" % (job_name, task_index)])
 
-    def _create_graph(self):
+        # start a tensor-flow server for a worker task
+        self.server = tf.train.Server(cluster_spec, job_name = job_name, task_index = task_index, config = server_config)
+        #print("Started server for job_name:%s, task_index:%d, is_chief:%d"% (job_name, task_index, (task_index==0)))
+        
+        # for the global graph, TF-ops and TF-variables should be on the CPU at
+        # the parameter servers
+        global_graph_device = 'cpu:0' 
+
+        self.global_graph = tf.Graph()
+        with self.global_graph.as_default() as g:
+          # between-graph replication
+          with tf.device(tf.train.replica_device_setter(worker_device="/job:%s/task:%d/%s" % (job_name, task_index, global_graph_device), cluster=cluster_spec)):
+            self._create_global_graph()
+            init_op = tf.global_variables_initializer()
+
+        sv = tf.train.Supervisor(graph=self.global_graph, is_chief = (task_index==0), init_op = init_op)
+
+        # Create a session for running ops on the graph. The init_op is run when we prepare the session 
+        self.global_sess = sv.prepare_or_wait_for_session(self.server.target, config = server_config)
+
+        if task_index==0: # only for chief
+          print("Asynchronous Distributed TF with %d replicas."%(num_workers))
+    
+    def _create_global_graph(self):
+      """
+      global graph vars are distributed over the parameter servers by TF. The
+      graph is the same as the local graph, but the TF-ops are not required
+      """
+
+      with tf.variable_scope('global'):
+        self.global_x = tf.placeholder(
+            tf.float32, [None, self.img_height, self.img_width, self.img_channels], name='X')
+        self.global_var_learning_rate = tf.placeholder(tf.float32, name='lr', shape=[])
+
+        # As implemented in A3C paper
+        self.global_n1 = self.conv2d_layer(self.global_x, 8, 16, 'conv11', strides=[1, 4, 4, 1])
+        self.global_n2 = self.conv2d_layer(self.global_n1, 4, 32, 'conv12', strides=[1, 2, 2, 1])
+        _input = self.global_n2
+
+        flatten_input_shape = _input.get_shape()
+        nb_elements = flatten_input_shape[1] * flatten_input_shape[2] * flatten_input_shape[3]
+
+        self.global_flat = tf.reshape(_input, shape=[-1, nb_elements._value])
+        self.global_d1 = self.dense_layer(self.global_flat, 256, 'dense1')
+        self.global_logits_v = tf.squeeze(self.dense_layer(self.global_d1, 1, 'logits_v', func=None), axis=[1])
+        self.global_logits_p = self.dense_layer(self.global_d1, self.num_actions, 'logits_p', func=None)
+        
+        if Config.USE_LOG_SOFTMAX:
+            self.global_softmax_p = tf.nn.softmax(self.global_logits_p)
+            self.global_log_softmax_p = tf.nn.log_softmax(self.global_logits_p)
+        else:
+            self.global_softmax_p = (tf.nn.softmax(self.global_logits_p) + Config.MIN_POLICY) / (1.0 + Config.MIN_POLICY * self.num_actions)
+  
+        self.global_opt = tf.train.RMSPropOptimizer(
+            learning_rate=self.global_var_learning_rate,
+            decay=Config.RMSPROP_DECAY,
+            momentum=Config.RMSPROP_MOMENTUM,
+            epsilon=Config.RMSPROP_EPSILON)
+  
+        self.global_tvs = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'global')
+        self.grads = [tf.placeholder(tf.float32, name='grad'+str(i),
+          shape=tv.get_shape().as_list()) for i,tv in enumerate(self.global_tvs)]
+
+        # Apply gradients from local network to global network
+        self.apply_global_grads = self.global_opt.apply_gradients(zip(self.grads, self.global_tvs))
+
+    def _create_local_graph(self):
+      with tf.variable_scope('local'):
         self.x = tf.placeholder(
             tf.float32, [None, self.img_height, self.img_width, self.img_channels], name='X')
         self.y_r = tf.placeholder(tf.float32, [None], name='Yr')
@@ -113,50 +195,35 @@ class NetworkVP:
         self.cost_p_2_agg = tf.reduce_sum(self.cost_p_2, axis=0)
         self.cost_p = -(self.cost_p_1_agg + self.cost_p_2_agg)
         
-        if Config.DUAL_RMSPROP:
-            self.opt_p = tf.train.RMSPropOptimizer(
-                learning_rate=self.var_learning_rate,
-                decay=Config.RMSPROP_DECAY,
-                momentum=Config.RMSPROP_MOMENTUM,
-                epsilon=Config.RMSPROP_EPSILON)
+        self.cost_all = self.cost_p + self.cost_v
+        self.opt = tf.train.RMSPropOptimizer(
+            learning_rate=self.var_learning_rate,
+            decay=Config.RMSPROP_DECAY,
+            momentum=Config.RMSPROP_MOMENTUM,
+            epsilon=Config.RMSPROP_EPSILON)
 
-            self.opt_v = tf.train.RMSPropOptimizer(
-                learning_rate=self.var_learning_rate,
-                decay=Config.RMSPROP_DECAY,
-                momentum=Config.RMSPROP_MOMENTUM,
-                epsilon=Config.RMSPROP_EPSILON)
-        else:
-            self.cost_all = self.cost_p + self.cost_v
-            self.opt = tf.train.RMSPropOptimizer(
-                learning_rate=self.var_learning_rate,
-                decay=Config.RMSPROP_DECAY,
-                momentum=Config.RMSPROP_MOMENTUM,
-                epsilon=Config.RMSPROP_EPSILON)
+        self.train_op = self.opt.minimize(self.cost_all, global_step=self.global_step)
+        
+        local_tvs = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, 'local')
+        
+        #Get gradients from local network using local losses
+        self.gvs = self.opt.compute_gradients(self.cost_all, local_tvs)
+        self.apply_local_grads = self.opt.apply_gradients(self.gvs)
 
-        if Config.USE_GRAD_CLIP:
-            if Config.DUAL_RMSPROP:
-                self.opt_grad_v = self.opt_v.compute_gradients(self.cost_v)
-                self.opt_grad_v_clipped = [(tf.clip_by_norm(g, Config.GRAD_CLIP_NORM),v) 
-                                            for g,v in self.opt_grad_v if not g is None]
-                self.train_op_v = self.opt_v.apply_gradients(self.opt_grad_v_clipped)
-            
-                self.opt_grad_p = self.opt_p.compute_gradients(self.cost_p)
-                self.opt_grad_p_clipped = [(tf.clip_by_norm(g, Config.GRAD_CLIP_NORM),v)
-                                            for g,v in self.opt_grad_p if not g is None]
-                self.train_op_p = self.opt_p.apply_gradients(self.opt_grad_p_clipped)
-                self.train_op = [self.train_op_p, self.train_op_v]
-            else:
-                self.opt_grad = self.opt.compute_gradients(self.cost_all)
-                self.opt_grad_clipped = [(tf.clip_by_average_norm(g, Config.GRAD_CLIP_NORM),v) for g,v in self.opt_grad]
-                self.train_op = self.opt.apply_gradients(self.opt_grad_clipped)
-        else:
-            if Config.DUAL_RMSPROP:
-                self.train_op_v = self.opt_p.minimize(self.cost_v, global_step=self.global_step)
-                self.train_op_p = self.opt_v.minimize(self.cost_p, global_step=self.global_step)
-                self.train_op = [self.train_op_p, self.train_op_v]
-            else:
-                self.train_op = self.opt.minimize(self.cost_all, global_step=self.global_step)
+        # gradient accumulator vars
+        self.accum_vars = [tf.Variable(tf.zeros_like(tv.initialized_value()),
+          trainable=False) for tv in local_tvs]
 
+        # reset accum_vars
+        self.zero_ops = [tv.assign(tf.zeros_like(tv)) for tv in self.accum_vars]
+        self.accum_ops = [self.accum_vars[i].assign_add(gv[0]) for i, gv in enumerate(self.gvs)]
+
+        self.gvals = [tf.placeholder(tf.float32, name='gval'+str(i),
+          shape=tv.get_shape().as_list()) for i,tv in enumerate(local_tvs)]
+        
+        # Update local variables with values from the global network
+        self.local_update = [tv.assign(self.gvals[i]) for i,tv in
+            enumerate(local_tvs)]
 
     def _create_tensor_board(self):
         summaries = tf.get_collection(tf.GraphKeys.SUMMARIES)
@@ -231,11 +298,44 @@ class NetworkVP:
     
     def predict_p_and_v(self, x):
         return self.sess.run([self.softmax_p, self.logits_v], feed_dict={self.x: x})
+
+    def get_comm_time(self, steps):
+      s = steps // Config.SYNC_FREQ 
+      return 0 if s == 0 else self.total_network_delay/float(s)
     
-    def train(self, x, y_r, a, trainer_id):
+    @timing
+    def run_timed_op(self, op, feed_dict):
+      if feed_dict == None:
+        return self.global_sess.run(op)
+      else:
+        return self.global_sess.run(op, feed_dict=feed_dict)
+
+    def syncGlobal(self):
+      accum = self.sess.run(self.accum_vars)
+      feed_dict = {self.global_var_learning_rate: self.learning_rate}
+      feed_dict.update({k:v for k,v in zip(self.grads, accum)})
+      
+      # apply gradients to global model
+      self.run_timed_op(self.apply_global_grads, feed_dict=feed_dict)
+
+    def syncLocal(self):
+      gv = self.run_timed_op(self.global_tvs, feed_dict=None)
+      
+      # update local model with parameters from global model
+      feed_dict={}
+      feed_dict.update({k:v for k,v in zip(self.gvals, gv)})
+      self.sess.run(self.local_update, feed_dict=feed_dict)
+
+    def train(self, x, y_r, a, trainer_id, steps):
         feed_dict = self.__get_base_feed_dict()
         feed_dict.update({self.x: x, self.y_r: y_r, self.action_index: a})
-        self.sess.run(self.train_op, feed_dict=feed_dict)
+        self.sess.run([self.accum_ops, self.apply_local_grads], feed_dict=feed_dict)
+        
+        if steps % Config.SYNC_FREQ == 0:
+          self.syncGlobal()
+          self.syncLocal()
+          # reset gradient accumulator
+          self.sess.run(self.zero_ops)
 
     def log(self, x, y_r, a):
         feed_dict = self.__get_base_feed_dict()

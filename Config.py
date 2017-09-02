@@ -30,7 +30,8 @@ class Config:
     # Game configuration
 
     # Name of the game, with version (e.g. PongDeterministic-v0)
-    ATARI_GAME = 'PongDeterministic-v0'
+    ATARI_GAME = 'BreakoutDeterministic-v0'
+    #ATARI_GAME = 'PongDeterministic-v0'
 
     # Enable to see the trained agent in action
     PLAY_MODE = False
@@ -46,17 +47,17 @@ class Config:
     
     # If the dynamic configuration is on, these are the initial values.
     # Number of Agents
-    AGENTS = 32 
+    AGENTS = 64 
     # Number of Predictors
-    PREDICTORS = 2
+    PREDICTORS = 3
     # Number of Trainers
-    TRAINERS = 2
+    TRAINERS = 3
 
     # Device
-    DEVICE = 'gpu:0'
+    DEVICE = '/gpu:0'
 
     # Enable the dynamic adjustment (+ waiting time to start it)
-    DYNAMIC_SETTINGS = True
+    DYNAMIC_SETTINGS = False
     DYNAMIC_SETTINGS_STEP_WAIT = 20
     DYNAMIC_SETTINGS_INITIAL_WAIT = 10
 
@@ -99,17 +100,19 @@ class Config:
     RMSPROP_MOMENTUM = 0.0
     RMSPROP_EPSILON = 0.1
 
-    # Dual RMSProp - we found that using a single RMSProp for the two cost function works better and faster
-    DUAL_RMSPROP = False
-    
-    # Gradient clipping
-    USE_GRAD_CLIP = False
-    GRAD_CLIP_NORM = 40.0 
     # Epsilon (regularize policy lag in GA3C)
     LOG_EPSILON = 1e-6
     # Training min batch size - increasing the batch size increases the stability of the algorithm, but make learning slower
-    TRAINING_MIN_BATCH_SIZE = 0
+    TRAINING_MIN_BATCH_SIZE = 40
+
+    # Frequency of synchronization for distributed training - number of local
+    # training steps before syncing with global
+    SYNC_FREQ = 10
     
+    # Profile time required for inter-node communication
+    PROFILE_COMM = False
+    PRINT_COMM_FREQUENCY = 500
+
     #########################################################################
     # Log and save
 
@@ -119,12 +122,12 @@ class Config:
     TENSORBOARD_UPDATE_FREQUENCY = 1000
 
     # Enable to save models every SAVE_FREQUENCY episodes
-    SAVE_MODELS = True
+    SAVE_MODELS = False
     # Save every SAVE_FREQUENCY episodes
-    SAVE_FREQUENCY = 1000
+    SAVE_FREQUENCY = 10000
     
     # Print stats every PRINT_STATS_FREQUENCY episodes
-    PRINT_STATS_FREQUENCY = 1
+    PRINT_STATS_FREQUENCY = 5
     # The window to average stats
     STAT_ROLLING_MEAN_WINDOW = 1000
 

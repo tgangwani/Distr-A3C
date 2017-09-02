@@ -40,8 +40,9 @@ from Config import Config
 
 
 class ProcessStats(Process):
-    def __init__(self):
+    def __init__(self, task_index):
         super(ProcessStats, self).__init__()
+        self.task_index = task_index
         self.episode_log_q = Queue(maxsize=100)
         self.episode_count = Value('i', 0)
         self.training_count = Value('i', 0)
@@ -50,6 +51,7 @@ class ProcessStats(Process):
         self.predictor_count = Value('i', 0)
         self.agent_count = Value('i', 0)
         self.total_frame_count = 0
+        self.comm_time = Value('f', 0)
 
     def FPS(self):
         # average FPS from the beginning of the training (not current FPS)
@@ -89,6 +91,15 @@ class ProcessStats(Process):
                 if self.episode_count.value % Config.SAVE_FREQUENCY == 0:
                     self.should_save_model.value = 1
 
+                if Config.PROFILE_COMM and self.episode_count.value % Config.PRINT_COMM_FREQUENCY == 0:  
+                  print('[Time: %8d] '
+                      '[TaskId: %8d] '
+                      '[Traffic(s): %10.4f]'
+                      %(int(time.time()-self.start_time),
+                        self.task_index,
+                        self.comm_time.value))
+                  sys.stdout.flush()
+  
                 if self.episode_count.value % Config.PRINT_STATS_FREQUENCY == 0:
                     print(
                         '[Time: %8d] '
