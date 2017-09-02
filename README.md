@@ -16,7 +16,7 @@ aprun -n $NT -N 1 -d 16 -cc none python3.4 GA3C.py -np $NP -nw $NW
 ## Plots
 
 #### Learning curves 
-This shows scaling from 1 to 8 worker nodes, keeping the number of parameter server nodes to 1. 
+This shows scaling from 1 to 8 worker nodes for ATARI ```Breakout```, keeping the number of parameter server nodes to 1. 
 
 <img src="./assets/scaling.png" width="400" height="300" />
 
